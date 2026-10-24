@@ -1,0 +1,141 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: EC2 Ubuntu 24.04 (VPC default) com SSH, JRE 21, Docker e MySQL em container (porta 3306 mapeada)
+
+Parameters:
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: Key pair existente para acesso SSH
+
+  InstanceType:
+    Type: String
+    Default: t3.small
+    AllowedValues: [t3.micro, t3.small, t3.medium, t3.large]
+
+  SshCidr:
+    Type: String
+    Description: IP/CIDR autorizado no SSH (ex 200.100.50.25/32). Evite 0.0.0.0/0
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$'
+
+  MysqlCidr:
+    Type: String
+    Default: 127.0.0.1/32
+    Description: IP/CIDR autorizado na porta 3306. O padrao deixa a porta fechada externamente
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$'
+
+  MysqlRootPassword:
+    Type: String
+    NoEcho: true
+    MinLength: 8
+    Description: Senha do root do MySQL (minimo 8 caracteres)
+
+  MysqlDatabase:
+    Type: String
+    Default: roadvizor
+    Description: Nome do banco criado automaticamente no container
+
+  MysqlUser:
+    Type: String
+    Default: roadvizor_user
+    Description: Usuario da aplicacao (com acesso ao banco acima)
+    
+  MysqlPassword:
+    Type: String
+    NoEcho: true
+    MinLength: 8
+    Description: Senha do usuario da aplicacao (minimo 8 caracteres)
+
+  MysqlImageTag:
+    Type: String
+    Default: "8.0"
+    Description: Tag da imagem mysql no Docker Hub (ex 8.0, 8.4, 9)
+
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id
+
+Resources:
+  # Sem VpcId/SubnetId: a AWS usa a VPC e a subnet default da regiao
+  SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: SSH e MySQL
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref SshCidr
+          Description: SSH
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          CidrIp: !Ref MysqlCidr
+          Description: MySQL
+      Tags:
+        - Key: Name
+          Value: sg-ec2-infra-roadvizor
+
+  Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref LatestAmiId
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyName
+      SecurityGroupIds:
+        - !GetAtt SecurityGroup.GroupId
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeSize: 30
+            VolumeType: gp3
+            Encrypted: true
+      Tags:
+        - Key: Name
+          Value: ec2-infra-roadvizor
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euxo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+
+          apt-get update -y
+          apt-get upgrade -y
+          apt-get install -y docker.io openjdk-21-jre-headless mysql-client
+
+          systemctl enable --now docker
+          usermod -aG docker ubuntu
+
+          # Grupo squad com sudo e usuarios do time
+          groupadd -f squad
+          echo '%squad ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/squad
+          chmod 440 /etc/sudoers.d/squad
+          visudo -cf /etc/sudoers.d/squad
+
+          for u in victor ancelmo gustavo isabella eduarda otavio; do
+            id "$u" &>/dev/null || useradd -m -s /bin/bash -G squad "$u"
+            install -d -m 700 -o "$u" -g "$u" "/home/$u/.ssh"
+            install -m 600 -o "$u" -g "$u" /home/ubuntu/.ssh/authorized_keys "/home/$u/.ssh/authorized_keys"
+          done
+
+          # Baixa a imagem oficial do MySQL
+          docker pull mysql:${MysqlImageTag}
+
+          # Cria o container: porta 3306 do host -> 3306 do container
+          # Cria tambem o banco e o usuario da aplicacao na primeira subida
+          docker run -d \
+            --name mysql \
+            --restart unless-stopped \
+            -p 3306:3306 \
+            -e MYSQL_ROOT_PASSWORD='${MysqlRootPassword}' \
+            -e MYSQL_DATABASE='${MysqlDatabase}' \
+            -e MYSQL_USER='${MysqlUser}' \
+            -e MYSQL_PASSWORD='${MysqlPassword}' \
+            -v /opt/mysql-data:/var/lib/mysql \
+            mysql:${MysqlImageTag}
+
+Outputs:
+  InstanceId:
+    Value: !Ref Instance
+  PublicIp:
+    Value: !GetAtt Instance.PublicIp
+  SshCommand:
+    Value: !Sub "ssh -i ${KeyName}.pem ubuntu@${Instance.PublicIp}"
