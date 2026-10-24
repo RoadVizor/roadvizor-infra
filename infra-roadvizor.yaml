@@ -37,7 +37,7 @@ Parameters:
     Type: String
     Default: roadvizor_user
     Description: Usuario da aplicacao (com acesso ao banco acima)
-    
+
   MysqlPassword:
     Type: String
     NoEcho: true
@@ -48,6 +48,19 @@ Parameters:
     Type: String
     Default: "8.0"
     Description: Tag da imagem mysql no Docker Hub (ex 8.0, 8.4, 9)
+
+  BucketSuffix:
+    Type: String
+    Default: roadvizor-sptech-1
+    MinLength: 3
+    MaxLength: 40
+    AllowedPattern: '^[a-z0-9][a-z0-9-]*[a-z0-9]$'
+    Description: Sufixo dos buckets S3 (minusculas, numeros e hifen). Nome final = datalake-CAMADA-sufixo. Nomes S3 sao unicos no mundo todo, se ja existir troque o sufixo
+
+  InstanceProfileName:
+    Type: String
+    Default: LabInstanceProfile
+    Description: Nome de um instance profile JA EXISTENTE na conta (no Learner Lab e LabInstanceProfile)
 
   LatestAmiId:
     Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
@@ -72,14 +85,75 @@ Resources:
           Description: MySQL
       Tags:
         - Key: Name
-          Value: sg-ec2-infra-roadvizor
+          Value: sg-ec2-docker-mysql
 
+  # ---------- Data lake: arquitetura medalhao ----------
+  BronzeBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "datalake-bronze-${BucketSuffix}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      Tags:
+        - Key: Camada
+          Value: bronze
+
+  SilverBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "datalake-silver-${BucketSuffix}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      Tags:
+        - Key: Camada
+          Value: silver
+
+  GoldBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "datalake-gold-${BucketSuffix}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      Tags:
+        - Key: Camada
+          Value: gold
+
+  # A EC2 usa o perfil de instancia ja existente no Learner Lab (LabInstanceProfile / LabRole),
+  # que da acesso ao S3 sem chaves de acesso. Nao e possivel criar roles IAM no lab.
   Instance:
     Type: AWS::EC2::Instance
     Properties:
       ImageId: !Ref LatestAmiId
       InstanceType: !Ref InstanceType
       KeyName: !Ref KeyName
+      IamInstanceProfile: !Ref InstanceProfileName
       SecurityGroupIds:
         - !GetAtt SecurityGroup.GroupId
       BlockDeviceMappings:
@@ -116,6 +190,15 @@ Resources:
             install -m 600 -o "$u" -g "$u" /home/ubuntu/.ssh/authorized_keys "/home/$u/.ssh/authorized_keys"
           done
 
+          # Nomes dos buckets do data lake (lido pelo executar-jar.sh)
+          cat > /etc/roadvizor-buckets.env <<EOF
+          S3_BUCKET_BRONZE=${BronzeBucket}
+          S3_BUCKET_SILVER=${SilverBucket}
+          S3_BUCKET_GOLD=${GoldBucket}
+          AWS_REGION=${AWS::Region}
+          EOF
+          chmod 644 /etc/roadvizor-buckets.env
+
           # Baixa a imagem oficial do MySQL
           docker pull mysql:${MysqlImageTag}
 
@@ -132,6 +215,9 @@ Resources:
             -v /opt/mysql-data:/var/lib/mysql \
             mysql:${MysqlImageTag}
 
+          # AWS CLI para testar o acesso aos buckets (aws s3 ls)
+          snap install aws-cli --classic || true
+
 Outputs:
   InstanceId:
     Value: !Ref Instance
@@ -139,3 +225,9 @@ Outputs:
     Value: !GetAtt Instance.PublicIp
   SshCommand:
     Value: !Sub "ssh -i ${KeyName}.pem ubuntu@${Instance.PublicIp}"
+  BucketBronze:
+    Value: !Ref BronzeBucket
+  BucketSilver:
+    Value: !Ref SilverBucket
+  BucketGold:
+    Value: !Ref GoldBucket
